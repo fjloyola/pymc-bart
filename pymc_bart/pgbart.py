@@ -15,7 +15,7 @@
 import logging
 
 from copy import deepcopy
-from numba import njit
+from numba import njit, typeof
 
 import numpy as np
 
@@ -27,9 +27,8 @@ from pymc.model import modelcontext
 from pymc.step_methods.arraystep import ArrayStepShared, Competence
 from pymc.pytensorf import inputvars, join_nonshared_inputs, make_shared_replacements
 
-
 from pymc_bart.bart import BARTRV
-from pymc_bart.tree import Tree, Node
+from pymc_bart.tree import Tree, Node, get_depth
 
 _log = logging.getLogger("pymc")
 
@@ -58,11 +57,11 @@ class PGBART(ArrayStepShared):
     stats_dtypes = [{"variable_inclusion": object}]
 
     def __init__(
-        self,
-        vars=None,  # pylint: disable=redefined-builtin
-        num_particles=20,
-        batch="auto",
-        model=None,
+            self,
+            vars=None,  # pylint: disable=redefined-builtin
+            num_particles=20,
+            batch="auto",
+            model=None,
     ):
         model = modelcontext(model)
         initial_values = model.initial_point()
@@ -95,9 +94,9 @@ class PGBART(ArrayStepShared):
         # if data is binary
         y_unique = np.unique(self.bart.Y)
         if y_unique.size == 2 and np.all(y_unique == [0, 1]):
-            mu_std = 3 / self.m**0.5
+            mu_std = 3 / self.m ** 0.5
         else:
-            mu_std = self.bart.Y.std() / self.m**0.5
+            mu_std = self.bart.Y.std() / self.m ** 0.5
 
         self.num_observations = self.X.shape[0]
         self.num_variates = self.X.shape[1]
@@ -110,8 +109,7 @@ class PGBART(ArrayStepShared):
         self.a_tree = Tree(
             leaf_node_value=init_mean / self.m,
             idx_data_points=np.arange(self.num_observations, dtype="int32"),
-            num_observations=self.num_observations,
-            shape=self.shape,
+            output=np.empty((self.num_observations, self.shape), np.float64),
         )
         self.normal = NormalSampler(mu_std, self.shape)
         self.uniform = UniformSampler(0.33, 0.75, self.shape)
@@ -241,7 +239,7 @@ class PGBART(ArrayStepShared):
         new_particles = []
         for idx in new_indices:
             if idx in seen:
-                new_particles.append(deepcopy(particles[idx]))
+                new_particles.append(particles[idx].copy())
             else:
                 new_particles.append(particles[idx])
                 seen.append(idx)
@@ -275,8 +273,8 @@ class PGBART(ArrayStepShared):
 
     def init_particles(self, tree_id: int) -> np.ndarray:
         """Initialize particles."""
-        p0 = self.all_particles[tree_id]
-        p1 = deepcopy(p0)
+        p0 = self.all_particles[tree_id].copy()
+        p1 = p0.copy()
         p1.sample_leafs(
             self.sum_trees,
             self.m,
@@ -336,23 +334,32 @@ class ParticleTree:
         self.old_likelihood_logp = 0
         self.kfactor = 0.75
 
+    def copy(self):
+        particle = ParticleTree(self.tree)
+        particle.expansion_nodes = self.expansion_nodes.copy()
+        particle.log_weight = self.log_weight
+        particle.old_likelihood_logp = self.old_likelihood_logp
+        particle.kfactor = self.kfactor
+
+        return particle
+
     def sample_tree(
-        self,
-        ssv,
-        available_predictors,
-        prior_prob_leaf_node,
-        X,
-        missing_data,
-        sum_trees,
-        m,
-        normal,
-        shape,
+            self,
+            ssv,
+            available_predictors,
+            prior_prob_leaf_node,
+            X,
+            missing_data,
+            sum_trees,
+            m,
+            normal,
+            shape,
     ):
         tree_grew = False
         if self.expansion_nodes:
             index_leaf_node = self.expansion_nodes.pop(0)
             # Probability that this node will remain a leaf node
-            prob_leaf = prior_prob_leaf_node[self.tree[index_leaf_node].depth]
+            prob_leaf = prior_prob_leaf_node[get_depth(index_leaf_node)]
 
             if prob_leaf < np.random.random():
                 index_selected_predictor = grow_tree(
@@ -431,23 +438,23 @@ def compute_prior_probability(alpha):
     prior_leaf_prob = [0]
     depth = 1
     while prior_leaf_prob[-1] < 1:
-        prior_leaf_prob.append(1 - alpha**depth)
+        prior_leaf_prob.append(1 - alpha ** depth)
         depth += 1
     return prior_leaf_prob
 
 
 def grow_tree(
-    tree,
-    index_leaf_node,
-    ssv,
-    available_predictors,
-    X,
-    missing_data,
-    sum_trees,
-    m,
-    normal,
-    kfactor,
-    shape,
+        tree,
+        index_leaf_node,
+        ssv,
+        available_predictors,
+        X,
+        missing_data,
+        sum_trees,
+        m,
+        normal,
+        kfactor,
+        shape,
 ):
     current_node = tree.get_node(index_leaf_node)
     idx_data_points = current_node.idx_data_points
@@ -479,17 +486,17 @@ def grow_tree(
                 shape,
             )
 
-            new_node = Node.new_leaf_node(
+            new_node = Node().new_leaf_node(
                 index=current_node_children[idx],
                 value=node_value,
                 idx_data_points=idx_data_point,
             )
             new_nodes.append(new_node)
 
-        new_split_node = Node.new_split_node(
-            index=index_leaf_node,
-            split_value=split_value,
-            idx_split_variable=selected_predictor,
+        new_split_node = Node().new_split_node(
+            index_leaf_node,
+            split_value,
+            selected_predictor,
         )
 
         # update tree nodes and indexes
@@ -502,7 +509,6 @@ def grow_tree(
 
 
 def get_new_idx_data_points(split_value, idx_data_points, selected_predictor, X):
-
     left_idx = X[idx_data_points, selected_predictor] <= split_value
     left_node_idx_data_points = idx_data_points[left_idx]
     right_node_idx_data_points = idx_data_points[~left_idx]
@@ -511,7 +517,6 @@ def get_new_idx_data_points(split_value, idx_data_points, selected_predictor, X)
 
 
 def get_split_value(available_splitting_values, idx_data_points, missing_data):
-
     if missing_data:
         idx_data_points = idx_data_points[~np.isnan(available_splitting_values)]
         available_splitting_values = available_splitting_values[

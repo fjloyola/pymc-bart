@@ -15,11 +15,79 @@
 import math
 
 from copy import deepcopy
+from functools import lru_cache
 
+from numba import int64, float64, typeof, types, njit, int32
+from numba.experimental import jitclass
 from pytensor import config
 import numpy as np
 
 
+@jitclass(spec=[
+    ("index", int64),
+    ("value", float64),
+    ("idx_split_variable", int64),
+    ("idx_data_points", types.Array(dtype=int32, ndim=1, layout="A"),)
+])
+class Node:
+    def __init__(self):
+        self.index = -1
+        self.value = 0.0
+        self.idx_data_points = np.empty(0, np.int32)
+        self.idx_split_variable = -1
+
+    def new_leaf_node(self, index, value, idx_data_points):
+        self.index = index
+        self.value = value
+        self.idx_data_points = idx_data_points
+        self.idx_split_variable = -1
+
+        return self
+
+    def new_split_node(self, index, split_value, idx_split_variable):
+        self.index = index
+        self.value = split_value
+        self.idx_data_points = np.empty(0, np.int32)
+        self.idx_split_variable = idx_split_variable
+
+        return self
+
+    def __getstate__(self):
+        return (self.index, self.value, self.idx_data_points, self.idx_split_variable)
+
+    def __setstate__(self, state):
+        self.index, self.value, self.idx_data_points, self.idx_split_variable = state
+
+    def __reduce__(self):
+        return (Node, (self.index, self.value, self.idx_data_points, self.idx_split_variable))
+
+    def get_idx_parent_node(self) -> int:
+        return (self.index - 1) // 2
+
+    def get_idx_left_child(self) -> int:
+        return self.index * 2 + 1
+
+    def get_idx_right_child(self) -> int:
+        return self.get_idx_left_child() + 1
+
+    def is_split_node(self) -> bool:
+        return self.idx_split_variable >= 0
+
+    def is_leaf_node(self) -> bool:
+        return not self.is_split_node()
+
+
+@lru_cache
+def get_depth(index: int) -> int:
+    return int(math.floor(math.log(index + 1, 2)))
+
+
+@jitclass(spec=[
+    ("tree_structure", types.DictType(int64, Node.class_type.instance_type)),
+    ("idx_leaf_nodes", int64[:],),
+    ("output", types.Array(dtype=float64, ndim=2, layout="A"),),  ## config.floatX[:]
+    ("leaf_node_value", float64),
+])
 class Tree:
     """Full binary tree.
 
@@ -47,19 +115,13 @@ class Tree:
     shape : int
     """
 
-    __slots__ = (
-        "tree_structure",
-        "idx_leaf_nodes",
-        "output",
-        "leaf_node_value",
-    )
-
-    def __init__(self, leaf_node_value, idx_data_points, num_observations, shape):
+    def __init__(self, leaf_node_value, idx_data_points, output):
         self.tree_structure = {
-            0: Node.new_leaf_node(0, value=leaf_node_value, idx_data_points=idx_data_points)
+            0: Node().new_leaf_node(0, leaf_node_value, idx_data_points)
         }
-        self.idx_leaf_nodes = [0]
-        self.output = np.zeros((num_observations, shape)).astype(config.floatX).squeeze()
+        self.idx_leaf_nodes = np.zeros(1, int64)
+        self.output = output
+        self.leaf_node_value = leaf_node_value
 
     def __getitem__(self, index):
         return self.get_node(index)
@@ -67,8 +129,25 @@ class Tree:
     def __setitem__(self, index, node):
         self.set_node(index, node)
 
+    def __getstate__(self):
+        return (self.tree_structure, self.idx_leaf_nodes, self.output, self.leaf_node_value)
+
+    def __setstate__(self, state):
+        self.tree_structure, self.idx_leaf_nodes, self.output, self.leaf_node_value = state
+
+    def __reduce__(self):
+        return (Tree, (self.tree_structure, self.idx_leaf_nodes, self.output, self.leaf_node_value))
+
     def copy(self):
-        return deepcopy(self)
+        tree = Tree(self.leaf_node_value, self.tree_structure[0].idx_data_points, self.output.copy())
+        for k, v in self.tree_structure.items():
+            node = Node()
+            node.index = v.index
+            node.value = v.value
+            node.idx_data_points = v.idx_data_points.copy()
+            node.idx_split_variable = v.idx_split_variable
+            tree[k] = node
+        return tree
 
     def get_node(self, index) -> "Node":
         return self.tree_structure[index]
@@ -76,7 +155,7 @@ class Tree:
     def set_node(self, index, node):
         self.tree_structure[index] = node
         if node.is_leaf_node():
-            self.idx_leaf_nodes.append(index)
+            np.append(self.idx_leaf_nodes, index)
 
     def delete_leaf_node(self, index):
         self.idx_leaf_nodes.remove(index)
@@ -88,7 +167,6 @@ class Tree:
         del a_tree.idx_leaf_nodes
         for k in a_tree.tree_structure.keys():
             current_node = a_tree[k]
-            del current_node.depth
             if current_node.is_leaf_node():
                 del current_node.idx_data_points
         return a_tree
@@ -167,41 +245,7 @@ class Tree:
         """
         node = self.get_node(node_index)
         if node.is_leaf_node():
-            leaf_values.append(node.value)
+            np.append(leaf_values, node.value)
         else:
             self._traverse_leaf_values(leaf_values, node.get_idx_left_child())
             self._traverse_leaf_values(leaf_values, node.get_idx_right_child())
-
-
-class Node:
-    __slots__ = "index", "depth", "value", "idx_split_variable", "idx_data_points"
-
-    def __init__(self, index: int, value=-1, idx_data_points=None, idx_split_variable=-1):
-        self.index = index
-        self.depth = int(math.floor(math.log(index + 1, 2)))
-        self.value = value
-        self.idx_data_points = idx_data_points
-        self.idx_split_variable = idx_split_variable
-
-    @classmethod
-    def new_leaf_node(cls, index: int, value, idx_data_points) -> "Node":
-        return cls(index, value=value, idx_data_points=idx_data_points)
-
-    @classmethod
-    def new_split_node(cls, index: int, split_value, idx_split_variable) -> "Node":
-        return cls(index, value=split_value, idx_split_variable=idx_split_variable)
-
-    def get_idx_parent_node(self) -> int:
-        return (self.index - 1) // 2
-
-    def get_idx_left_child(self) -> int:
-        return self.index * 2 + 1
-
-    def get_idx_right_child(self) -> int:
-        return self.get_idx_left_child() + 1
-
-    def is_split_node(self) -> bool:
-        return self.idx_split_variable >= 0
-
-    def is_leaf_node(self) -> bool:
-        return not self.is_split_node()
